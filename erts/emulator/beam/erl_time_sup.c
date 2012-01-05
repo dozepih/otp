@@ -494,6 +494,7 @@ get_time(int *hour, int *minute, int *second)
     
     the_clock = time((time_t *)0);
 #ifdef HAVE_LOCALTIME_R
+    tzset();
     tm = localtime_r(&the_clock, &tmbuf);
 #else
     tm = localtime(&the_clock);
@@ -516,6 +517,7 @@ get_date(int *year, int *month, int *day)
 
     the_clock = time((time_t *)0);
 #ifdef HAVE_LOCALTIME_R
+    tzset();
     tm = localtime_r(&the_clock, &tmbuf);
 #else
     tm = localtime(&the_clock);
@@ -538,7 +540,8 @@ get_localtime(int *year, int *month, int *day,
 
     the_clock = time((time_t *)0);
 #ifdef HAVE_LOCALTIME_R
-    localtime_r(&the_clock, (tm = &tmbuf));
+    tzset();
+    tm = localtime_r(&the_clock, &tmbuf);
 #else
     tm = localtime(&the_clock);
 #endif
@@ -827,6 +830,7 @@ univ_to_local(Sint *year, Sint *month, Sint *day,
 #endif
 
 #ifdef HAVE_LOCALTIME_R
+    tzset();
     tm = localtime_r(&the_clock, &tmbuf);
 #else
     tm = localtime(&the_clock);
