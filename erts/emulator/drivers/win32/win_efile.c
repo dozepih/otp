@@ -769,13 +769,14 @@ efile_may_openfile(Efile_error* errInfo, char *name) {
     WCHAR *wname = (WCHAR *) name;
     DWORD attr;
 
-    if ((attr = GetFileAttributesW(wname)) == INVALID_FILE_ATTRIBUTES) {
-	return check_error(-1, errInfo);
+    if ((attr = GetFileAttributes(wname)) == INVALID_FILE_ATTRIBUTES) {
+        return 0;
     }
 
     if (attr & FILE_ATTRIBUTE_DIRECTORY) {
 	errno = EISDIR;
 	return check_error(-1, errInfo);
+        return 0;
     }
     return 1;
 }

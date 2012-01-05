@@ -52,7 +52,9 @@
 	 make_symlink/2, make_symlink/3,
 	 read_link/1, read_link/2,
 	 read_link_info/1, read_link_info/2, read_link_info/3,
-	 list_dir/1, list_dir/2]).
+	 list_dir/1, list_dir/2,
+         exists/1, exists/2]).
+
 %% How to start and stop the ?DRV port.
 -export([start/0, stop/1]).
 
@@ -100,6 +102,8 @@
 -define(FILE_FDATASYNC,        30).
 -define(FILE_ADVISE,           31).
 -define(FILE_SENDFILE,         32).
+-define(FILE_EXISTS,           33).
+
 
 %% Driver responses
 -define(FILE_RESP_OK,          0).
@@ -899,6 +903,22 @@ list_dir(Port, Dir) when is_port(Port) ->
 list_dir_int(Port, Dir) ->
     drv_command(Port, [?FILE_READDIR, pathname(Dir)], []).
 
+
+
+%% exists/{1,2}
+
+exists(File) ->
+    exists_int({?DRV, []}, File).
+
+exists(Port, File) when is_port(Port) ->
+    exists_int(Port, File).
+
+exists_int(Port, File) ->
+    case drv_command(Port, [?FILE_EXISTS, File, 0]) of
+        ok -> true;
+        {error, enoent} -> false;
+        {error, eisdir} -> {error, eisdir}
+    end.
 
 
 %%%-----------------------------------------------------------------
