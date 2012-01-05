@@ -40,7 +40,8 @@
 -export([send/2, recv/3, connect/7, ssl_accept/6, handshake/2,
 	 socket_control/3, close/1, shutdown/2,
 	 new_user/2, get_opts/2, set_opts/2, info/1, session_info/1, 
-	 peer_certificate/1, sockname/1, peername/1, renegotiation/1]).
+	 peer_certificate/1, sockname/1, peername/1, renegotiation/1,
+	 negotiated_next_protocol/1]).
 
 %% Called by ssl_connection_sup
 -export([start_link/7]). 
@@ -91,7 +92,9 @@
 	  recv_from,           %
 	  send_queue,          % queue()
 	  terminated = false,  %
-	  allow_renegotiate = true
+	  allow_renegotiate = true,
+          expecting_next_protocol_negotiation = false :: boolean(),
+          next_protocol = undefined :: undefined | binary()
 	 }).
 
 -define(DEFAULT_DIFFIE_HELLMAN_PARAMS, 
@@ -219,6 +222,13 @@ new_user(ConnectionPid, User) ->
 %%--------------------------------------------------------------------
 sockname(ConnectionPid) ->
     sync_send_all_state_event(ConnectionPid, sockname).
+%%--------------------------------------------------------------------
+-spec negotiated_next_protocol(pid()) -> {ok, binary()} | {error, reason()}.
+%%
+%% Description:  Returns the negotiated protocol
+%%--------------------------------------------------------------------
+negotiated_next_protocol(ConnectionPid) ->
+    sync_send_all_state_event(ConnectionPid, negotiated_next_protocol).
 %%--------------------------------------------------------------------
 -spec peername(pid()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, reason()}.
 %%
@@ -370,29 +380,39 @@ hello(#server_hello{cipher_suite = CipherSuite,
 	     renegotiation = {Renegotiation, _},
 	     ssl_options = SslOptions} = State0) ->
     case ssl_handshake:hello(Hello, SslOptions, ConnectionStates0, Renegotiation) of
-	{Version, NewId, ConnectionStates} ->
+        #alert{} = Alert ->
+            handle_own_alert(Alert, ReqVersion, hello, State0),
+            {stop, normal, State0};
+
+	{Version, NewId, ConnectionStates, NextProtocol} ->
 	    {KeyAlgorithm, _, _} =
 		ssl_cipher:suite_definition(CipherSuite),
-	    
+
 	    PremasterSecret = make_premaster_secret(ReqVersion, KeyAlgorithm),
-	    
+
+		NewNextProtocol = case NextProtocol of
+			undefined ->
+				State0#state.next_protocol;
+			_ ->
+				NextProtocol
+		end,
+
 	    State = State0#state{key_algorithm = KeyAlgorithm,
 				 negotiated_version = Version,
 				 connection_states = ConnectionStates,
-				 premaster_secret = PremasterSecret},
-	    
+				 premaster_secret = PremasterSecret,
+				 expecting_next_protocol_negotiation = NextProtocol =/= undefined,
+				 next_protocol = NewNextProtocol},
+
 	    case ssl_session:is_new(OldId, NewId) of
 		true ->
 		    handle_new_session(NewId, CipherSuite, Compression, State);
 		false ->
-		    handle_resumed_session(NewId, State#state{connection_states = ConnectionStates}) 
-	    end;
-	#alert{} = Alert ->
-	    handle_own_alert(Alert, ReqVersion, hello, State0), 
-            {stop, normal, State0}
+		    handle_resumed_session(NewId, State#state{connection_states = ConnectionStates})
+	    end
     end;
 
-hello(Hello = #client_hello{client_version = ClientVersion}, 
+hello(Hello = #client_hello{client_version = ClientVersion},
       State = #state{connection_states = ConnectionStates0,
 		     port = Port, session = #session{own_certificate = Cert} = Session0,
 		     renegotiation = {Renegotiation, _},
@@ -401,8 +421,8 @@ hello(Hello = #client_hello{client_version = ClientVersion},
 		     ssl_options = SslOpts}) ->
     case ssl_handshake:hello(Hello, SslOpts, {Port, Session0, Cache, CacheCb,
 				     ConnectionStates0, Cert}, Renegotiation) of
-        {Version, {Type, Session}, ConnectionStates} ->       
-            do_server_hello(Type, State#state{connection_states  = 
+        {Version, {Type, Session}, ConnectionStates, ProtocolsToAdvertise} ->
+            do_server_hello(Type, ProtocolsToAdvertise, State#state{connection_states  =
 					      ConnectionStates,
 					      negotiated_version = Version,
 					      session = Session});
@@ -585,6 +605,7 @@ certify(#client_key_exchange{exchange_keys = Keys},
 	    {stop, normal, State}
     end;
 
+
 certify(timeout, State) ->
     { next_state, certify, State, hibernate };
 
@@ -649,6 +670,11 @@ cipher(#certificate_verify{signature = Signature},
 	    {stop, normal, State0}
     end;
 
+% client must send a next protocol message if we are expecting it
+cipher(#finished{}, #state{role = server, expecting_next_protocol_negotiation = true, next_protocol = undefined, negotiated_version = Version} = State0) ->
+       handle_own_alert(?ALERT_REC(?FATAL,?UNEXPECTED_MESSAGE), Version, cipher, State0),
+       {stop, normal, State0};
+
 cipher(#finished{verify_data = Data} = Finished, 
        #state{negotiated_version = Version,
 	      host = Host,
@@ -667,6 +693,12 @@ cipher(#finished{verify_data = Data} = Finished,
 	    handle_own_alert(Alert, Version, cipher, State),
             {stop, normal, State} 
     end;
+
+% only allowed to send next_protocol message after change cipher spec & before finished message and it is not allowed
+% during renegotiation
+cipher(#next_protocol{selected_protocol = SelectedProtocol}, #state{role = server, expecting_next_protocol_negotiation = true} = State0) ->
+	{Record, State} = next_record(State0#state{next_protocol = SelectedProtocol}),
+    next_state(cipher, cipher, Record, State);
 
 cipher(timeout, State) ->
     { next_state, cipher, State, hibernate };
@@ -822,6 +854,10 @@ handle_sync_event(sockname, _From, StateName,
     SockNameReply = inet:sockname(Socket),
     {reply, SockNameReply, StateName, State, get_timeout(State)};
 
+handle_sync_event(negotiated_next_protocol, _From, StateName, #state{next_protocol = undefined} = State) ->
+    {reply, {error, next_protocol_not_negotiated}, StateName, State, get_timeout(State)};
+handle_sync_event(negotiated_next_protocol, _From, StateName, #state{next_protocol = NextProtocol} = State) ->
+    {reply, {ok, NextProtocol}, StateName, State, get_timeout(State)};
 handle_sync_event(peername, _From, StateName,
 		  #state{socket = Socket} = State) ->
     PeerNameReply = inet:peername(Socket),
@@ -1223,7 +1259,9 @@ verify_client_cert(#state{client_certificate_requested = true, role = client,
 verify_client_cert(#state{client_certificate_requested = false} = State) ->
     State.
 
-do_server_hello(Type, #state{negotiated_version = Version,
+
+
+do_server_hello(Type, NextProtocolsToSend, #state{negotiated_version = Version,
 			     session = #session{session_id = SessId} = Session,
 			     connection_states = ConnectionStates0,
 			     renegotiation = {Renegotiation, _}} 
@@ -1231,8 +1269,8 @@ do_server_hello(Type, #state{negotiated_version = Version,
 
     ServerHello = 
         ssl_handshake:server_hello(SessId, Version, 
-                                   ConnectionStates0, Renegotiation),
-    State1 = server_hello(ServerHello, State0),
+                                   ConnectionStates0, Renegotiation, NextProtocolsToSend),
+    State1 = server_hello(ServerHello, State0#state{expecting_next_protocol_negotiation = NextProtocolsToSend =/= undefined}),
     
     case Type of	
 	new ->
@@ -1475,12 +1513,30 @@ request_client_cert(#state{ssl_options = #ssl_options{verify = verify_none}} =
     State.
 
 finalize_handshake(State, StateName) ->
-    ConnectionStates0 = cipher_protocol(State),    
+    ConnectionStates0 = cipher_protocol(State),
+
     ConnectionStates =
         ssl_record:activate_pending_connection_state(ConnectionStates0,
                                                      write),
-    finished(State#state{connection_states = ConnectionStates}, StateName).
-    
+
+    State1 = State#state{connection_states = ConnectionStates},
+    State2 = next_protocol(State1),
+    finished(State2, StateName).
+
+
+next_protocol(#state{role = server} = State) ->
+    State;
+next_protocol(#state{next_protocol = undefined} = State) ->
+    State;
+next_protocol(#state{expecting_next_protocol_negotiation = false} = State) ->
+    State;
+next_protocol(#state{transport_cb = Transport, socket = Socket, negotiated_version = Version, next_protocol = NextProtocol, connection_states = ConnectionStates0, tls_handshake_hashes = Hashes0} = State) ->
+    NextProtocolMessage = ssl_handshake:next_protocol(NextProtocol),
+    {BinMsg, ConnectionStates, Hashes} = encode_handshake(NextProtocolMessage, Version, ConnectionStates0, Hashes0),
+    Transport:send(Socket, BinMsg),
+    State#state{connection_states = ConnectionStates,
+                tls_handshake_hashes = Hashes}.
+
 cipher_protocol(#state{connection_states = ConnectionStates0,
                        socket = Socket,
                        negotiated_version = Version,

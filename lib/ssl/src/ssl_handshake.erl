@@ -30,14 +30,15 @@
 -include("ssl_internal.hrl").
 -include_lib("public_key/include/public_key.hrl").
 
--export([master_secret/4, client_hello/6, server_hello/4, hello/4,
+-export([master_secret/4, client_hello/6, server_hello/5, hello/4,
 	 hello_request/0, certify/7, certificate/4,
 	 client_certificate_verify/5, certificate_verify/5,
 	 certificate_request/3, key_exchange/2, server_key_exchange_hash/2,
 	 finished/4, verify_connection/5, get_tls_handshake/2,
 	 decode_client_key/3, server_hello_done/0,
 	 encode_handshake/2, init_hashes/0, update_hashes/2,
-	 decrypt_premaster_secret/2]).
+	 decrypt_premaster_secret/2,
+         next_protocol/1]).
 
 -export([dec_hello_extensions/2]).
 
@@ -45,6 +46,13 @@
 			 #server_hello_done{} | #certificate{} | #certificate_request{} |
 			 #client_key_exchange{} | #finished{} | #certificate_verify{} |
 			 #hello_request{}.
+
+encode_client_protocol_negotiation(undefined, _) ->
+       undefined;
+encode_client_protocol_negotiation(_, false) ->
+	#next_protocol_negotiation{extension_data = <<>>};
+encode_client_protocol_negotiation(_, _) ->
+	undefined.
 
 %%====================================================================
 %% Internal application API
@@ -75,16 +83,27 @@ client_hello(Host, Port, ConnectionStates, #ssl_options{versions = Versions,
 		  compression_methods = ssl_record:compressions(),
 		  random = SecParams#security_parameters.client_random,
 		  renegotiation_info  = 
-		  renegotiation_info(client, ConnectionStates, Renegotiation)
+		  renegotiation_info(client, ConnectionStates, Renegotiation),
+		  next_protocol_negotiation = encode_client_protocol_negotiation(SslOpts#ssl_options.next_protocol_selector, Renegotiation)
 		 }.
+
+encode_protocol(Protocol, Acc) ->
+	Len = byte_size(Protocol),
+	<<Acc/binary, ?BYTE(Len), Protocol/binary>>.
+
+encode_protocols_advertised_on_server(undefined) ->
+	undefined;
+
+encode_protocols_advertised_on_server(Protocols) ->
+	#next_protocol_negotiation{extension_data = lists:foldl(fun encode_protocol/2, <<>>, Protocols)}.
 
 %%--------------------------------------------------------------------
 -spec server_hello(session_id(), tls_version(), #connection_states{}, 
-		   boolean()) -> #server_hello{}.
+		   boolean(), list(string())) -> #server_hello{}.
 %%
 %% Description: Creates a server hello message.
 %%--------------------------------------------------------------------
-server_hello(SessionId, Version, ConnectionStates, Renegotiation) ->
+server_hello(SessionId, Version, ConnectionStates, Renegotiation, ProtocolsAdvertisedOnServer) ->
     Pending = ssl_record:pending_connection_state(ConnectionStates, read),
     SecParams = Pending#connection_state.security_parameters,
     #server_hello{server_version = Version,
@@ -94,7 +113,8 @@ server_hello(SessionId, Version, ConnectionStates, Renegotiation) ->
 		  random = SecParams#security_parameters.server_random,
 		  session_id = SessionId,
 		  renegotiation_info = 
-		  renegotiation_info(server, ConnectionStates, Renegotiation)
+		  renegotiation_info(server, ConnectionStates, Renegotiation),
+		  next_protocol_negotiation = encode_protocols_advertised_on_server(ProtocolsAdvertisedOnServer)
 		 }.
 
 %%--------------------------------------------------------------------
@@ -109,17 +129,19 @@ hello_request() ->
 %%--------------------------------------------------------------------
 -spec hello(#server_hello{} | #client_hello{}, #ssl_options{},
 	    #connection_states{} | {inet:port_number(), #session{}, db_handle(),
- 				    atom(), #connection_states{}, binary()},
- 	    boolean()) -> {tls_version(), session_id(), #connection_states{}}| 
- 			  {tls_version(), {resumed | new, #session{}}, 
- 			   #connection_states{}} | #alert{}.
+				    atom(), #connection_states{}, binary()},
+	    boolean()) ->
+			  {tls_version(), session_id(), #connection_states{}, binary() | undefined}|
+			  {tls_version(), {resumed | new, #session{}}, #connection_states{}, list(binary()) | undefined} |
+			  #alert{}.
 %%
 %% Description: Handles a recieved hello message
 %%--------------------------------------------------------------------
 hello(#server_hello{cipher_suite = CipherSuite, server_version = Version,
 		    compression_method = Compression, random = Random,
-		    session_id = SessionId, renegotiation_info = Info},
-      #ssl_options{secure_renegotiate = SecureRenegotation},
+		    renegotiation_info = Info,
+		    session_id = SessionId} = Hello,
+      #ssl_options{secure_renegotiate = SecureRenegotation, next_protocol_selector = NextProtocolSelector},
       ConnectionStates0, Renegotiation) ->
 
     case ssl_record:is_acceptable_version(Version) of
@@ -130,7 +152,12 @@ hello(#server_hello{cipher_suite = CipherSuite, server_version = Version,
 		    ConnectionStates =
 			hello_pending_connection_states(client, CipherSuite, Random, 
 							Compression, ConnectionStates1),
-		    {Version, SessionId, ConnectionStates};
+			case handle_next_protocol(Hello, NextProtocolSelector, Renegotiation) of
+			    #alert{} = Alert ->
+			        Alert;
+			    Protocol ->
+			        {Version, SessionId, ConnectionStates, Protocol}
+			end;
 		#alert{} = Alert ->
 		    Alert
 	    end;
@@ -141,7 +168,7 @@ hello(#server_hello{cipher_suite = CipherSuite, server_version = Version,
 hello(#client_hello{client_version = ClientVersion, random = Random,
 		    cipher_suites = CipherSuites,
 		    renegotiation_info = Info} = Hello,
-      #ssl_options{versions = Versions, 
+      #ssl_options{versions = Versions,
 		   secure_renegotiate = SecureRenegotation} = SslOpts,
       {Port, Session0, Cache, CacheCb, ConnectionStates0, Cert}, Renegotiation) ->
     Version = select_version(ClientVersion, Versions),
@@ -165,7 +192,12 @@ hello(#client_hello{client_version = ClientVersion, random = Random,
 								Random, 
 								Compression,
 								ConnectionStates1),
-			    {Version, {Type, Session}, ConnectionStates};
+				case handle_next_protocol_on_server(Hello, Renegotiation, SslOpts) of
+					#alert{} = Alert ->
+						Alert;
+					ProtocolsToAdvertise ->
+						{Version, {Type, Session}, ConnectionStates, ProtocolsToAdvertise}
+			    end;
 			#alert{} = Alert ->
 			    Alert
 		    end
@@ -409,6 +441,11 @@ master_secret(Version, PremasterSecret, ConnectionStates, Role) ->
 	    ?ALERT_REC(?FATAL, ?HANDSHAKE_FAILURE)
     end.
 
+-spec next_protocol(binary()) -> #next_protocol{}.
+
+next_protocol(SelectedProtocol) ->
+  #next_protocol{selected_protocol = SelectedProtocol}.
+
 %%--------------------------------------------------------------------
 -spec finished(tls_version(), client | server, binary(), {{binary(), binary()},_}) ->
     #finished{}.
@@ -636,6 +673,56 @@ renegotiation_info(server, ConnectionStates, true) ->
 	    #renegotiation_info{renegotiated_connection = undefined}
     end. 
 
+decode_next_protocols({next_protocol_negotiation, Protocols}) ->
+    decode_next_protocols(Protocols, []).
+decode_next_protocols(<<>>, Acc) ->
+    lists:reverse(Acc);
+decode_next_protocols(<<?BYTE(Len), Protocol:Len/binary, Rest/binary>>, Acc) ->
+    case Len of
+        0 ->
+            {error, invalid_next_protocols};
+        _ ->
+            decode_next_protocols(Rest, [Protocol|Acc])
+    end;
+decode_next_protocols(_Bytes, _Acc) ->
+    {error, invalid_next_protocols}.
+
+next_protocol_extension_allowed(NextProtocolSelector, Renegotiating) ->
+    NextProtocolSelector =/= undefined andalso not Renegotiating.
+
+handle_next_protocol_on_server(#client_hello{next_protocol_negotiation = undefined}, _Renegotiation, _SslOpts) ->
+    undefined;
+
+handle_next_protocol_on_server(#client_hello{next_protocol_negotiation =  {next_protocol_negotiation,<<>>}}, false, #ssl_options{next_protocols_advertised = Protocols}) ->
+    Protocols;
+
+handle_next_protocol_on_server(_Hello, _Renegotiation, _SSLOpts) ->
+    ?ALERT_REC(?FATAL, ?HANDSHAKE_FAILURE). % unexpected next protocol extension
+
+handle_next_protocol(#server_hello{next_protocol_negotiation = undefined},
+    _NextProtocolSelector, _Renegotiating) ->
+    undefined;
+
+handle_next_protocol(#server_hello{next_protocol_negotiation = Protocols},
+    NextProtocolSelector, Renegotiating) ->
+
+    case next_protocol_extension_allowed(NextProtocolSelector, Renegotiating) of
+        true ->
+            select_next_protocol(decode_next_protocols(Protocols), NextProtocolSelector);
+        false ->
+            ?ALERT_REC(?FATAL, ?HANDSHAKE_FAILURE) % unexpected next protocol extension
+    end.
+
+select_next_protocol({error, _Reason}, _NextProtocolSelector) ->
+    ?ALERT_REC(?FATAL, ?HANDSHAKE_FAILURE);
+select_next_protocol(Protocols, NextProtocolSelector) ->
+    case NextProtocolSelector(Protocols) of
+      Protocol when is_binary(Protocol), byte_size(Protocol) > 0 ->
+          Protocol;
+      _ ->
+          ?ALERT_REC(?FATAL, ?INTERNAL_ERROR) % we are broken internally :( api presently stops this but we might let it happen in future
+    end.
+
 handle_renegotiation_info(_, #renegotiation_info{renegotiated_connection = ?byte(0)}, 
 			  ConnectionStates, false, _, _) ->
     {ok, ssl_record:set_renegotiation_flag(true, ConnectionStates)};
@@ -791,6 +878,10 @@ master_secret(Version, MasterSecret, #security_parameters{
 					 ServerCipherState, Role)}.
 
 
+dec_hs(?NEXT_PROTOCOL, <<?BYTE(SelectedProtocolLength), SelectedProtocol:SelectedProtocolLength/binary,
+                         ?BYTE(PaddingLength), _Padding:PaddingLength/binary>>) ->
+	#next_protocol{selected_protocol = SelectedProtocol};
+
 dec_hs(?HELLO_REQUEST, <<>>) ->
     #hello_request{};
 
@@ -814,16 +905,19 @@ dec_hs(?CLIENT_HELLO, <<?BYTE(Major), ?BYTE(Minor), Random:32/binary,
 		       ?UINT16(Cs_length), CipherSuites:Cs_length/binary,
 		       ?BYTE(Cm_length), Comp_methods:Cm_length/binary,
 		       Extensions/binary>>) ->
-    
-    RenegotiationInfo = proplists:get_value(renegotiation_info, dec_hello_extensions(Extensions),
-					   undefined),    
+
+	DecodedExtensions = dec_hello_extensions(Extensions),
+	RenegotiationInfo = proplists:get_value(renegotiation_info, DecodedExtensions, undefined),
+	NextProtocolNegotiation = proplists:get_value(next_protocol_negotiation, DecodedExtensions, undefined),
+
     #client_hello{
 	client_version = {Major,Minor},
 	random = Random,
 	session_id = Session_ID,
 	cipher_suites = from_2bytes(CipherSuites),
 	compression_methods = Comp_methods,
-	renegotiation_info = RenegotiationInfo 
+	renegotiation_info = RenegotiationInfo,
+	next_protocol_negotiation = NextProtocolNegotiation
        };
 
 dec_hs(?SERVER_HELLO, <<?BYTE(Major), ?BYTE(Minor), Random:32/binary,
@@ -839,18 +933,21 @@ dec_hs(?SERVER_HELLO, <<?BYTE(Major), ?BYTE(Minor), Random:32/binary,
 
 dec_hs(?SERVER_HELLO, <<?BYTE(Major), ?BYTE(Minor), Random:32/binary,
 		       ?BYTE(SID_length), Session_ID:SID_length/binary,
-		       Cipher_suite:2/binary, ?BYTE(Comp_method), 
+		       Cipher_suite:2/binary, ?BYTE(Comp_method),
 		       ?UINT16(ExtLen), Extensions:ExtLen/binary>>) ->
-    
-    RenegotiationInfo = proplists:get_value(renegotiation_info, dec_hello_extensions(Extensions, []),
-					   undefined),   
+
+	DecodedExtensions = dec_hello_extensions(Extensions, []),
+	RenegotiationInfo = proplists:get_value(renegotiation_info, DecodedExtensions, undefined),
+	NextProtocolNegotiation = proplists:get_value(next_protocol_negotiation, DecodedExtensions, undefined),
+
     #server_hello{
 	server_version = {Major,Minor},
 	random = Random,
 	session_id = Session_ID,
 	cipher_suite = Cipher_suite,
 	compression_method = Comp_method,
-	renegotiation_info = RenegotiationInfo};
+	renegotiation_info = RenegotiationInfo,
+	next_protocol_negotiation = NextProtocolNegotiation};
 dec_hs(?CERTIFICATE, <<?UINT24(ACLen), ASN1Certs:ACLen/binary>>) ->
     #certificate{asn1_certificates = certs_to_list(ASN1Certs)};
 
@@ -903,6 +1000,9 @@ dec_hello_extensions(_) ->
 
 dec_hello_extensions(<<>>, Acc) ->
     Acc;
+dec_hello_extensions(<<?UINT16(?NEXTPROTONEG_EXT), ?UINT16(Len), ExtensionData:Len/binary, Rest/binary>>, Acc) ->
+    Prop = {next_protocol_negotiation, #next_protocol_negotiation{extension_data = ExtensionData}},
+    dec_hello_extensions(Rest, [Prop | Acc]);
 dec_hello_extensions(<<?UINT16(?RENEGOTIATION_EXT), ?UINT16(Len), Info:Len/binary, Rest/binary>>, Acc) ->
     RenegotiateInfo = case Len of
 			  1 ->  % Initial handshake
@@ -917,6 +1017,7 @@ dec_hello_extensions(<<?UINT16(?RENEGOTIATION_EXT), ?UINT16(Len), Info:Len/binar
 
 %% Ignore data following the ClientHello (i.e.,
 %% extensions) if not understood.
+
 dec_hello_extensions(<<?UINT16(_), ?UINT16(Len), _Unknown:Len/binary, Rest/binary>>, Acc) ->
     dec_hello_extensions(Rest, Acc);
 %% This theoretically should not happen if the protocol is followed, but if it does it is ignored.
@@ -949,6 +1050,11 @@ certs_from_list(ACList) ->
                         <<?UINT24(CertLen), Cert/binary>>
 		    end || Cert <- ACList]).
 
+enc_hs(#next_protocol{selected_protocol = SelectedProtocol}, _Version) ->
+    PaddingLength = 32 - ((byte_size(SelectedProtocol) + 2) rem 32),
+
+    {?NEXT_PROTOCOL, <<?BYTE((byte_size(SelectedProtocol))), SelectedProtocol/binary,
+                         ?BYTE(PaddingLength), 0:(PaddingLength * 8)>>};
 enc_hs(#hello_request{}, _Version) ->
     {?HELLO_REQUEST, <<>>};
 enc_hs(#client_hello{client_version = {Major, Minor},
@@ -956,13 +1062,14 @@ enc_hs(#client_hello{client_version = {Major, Minor},
 		     session_id = SessionID,
 		     cipher_suites = CipherSuites,
 		     compression_methods = CompMethods, 
-		     renegotiation_info = RenegotiationInfo}, _Version) ->
+		     renegotiation_info = RenegotiationInfo,
+		     next_protocol_negotiation = NextProtocolNegotiation}, _Version) ->
     SIDLength = byte_size(SessionID),
     BinCompMethods = list_to_binary(CompMethods),
     CmLength = byte_size(BinCompMethods),
     BinCipherSuites = list_to_binary(CipherSuites),
     CsLength = byte_size(BinCipherSuites),
-    Extensions  = hello_extensions(RenegotiationInfo),
+    Extensions  = hello_extensions(RenegotiationInfo, NextProtocolNegotiation),
     ExtensionsBin = enc_hello_extensions(Extensions),
     {?CLIENT_HELLO, <<?BYTE(Major), ?BYTE(Minor), Random:32/binary,
 		     ?BYTE(SIDLength), SessionID/binary,
@@ -974,9 +1081,10 @@ enc_hs(#server_hello{server_version = {Major, Minor},
 		     session_id = Session_ID,
 		     cipher_suite = Cipher_suite,
 		     compression_method = Comp_method,
-		     renegotiation_info = RenegotiationInfo}, _Version) ->
+		     renegotiation_info = RenegotiationInfo,
+		     next_protocol_negotiation = NextProtocolNegotiation}, _Version) ->
     SID_length = byte_size(Session_ID),
-    Extensions  = hello_extensions(RenegotiationInfo),
+    Extensions  = hello_extensions(RenegotiationInfo, NextProtocolNegotiation),
     ExtensionsBin = enc_hello_extensions(Extensions),
     {?SERVER_HELLO, <<?BYTE(Major), ?BYTE(Minor), Random:32/binary,
 		     ?BYTE(SID_length), Session_ID/binary,
@@ -1029,10 +1137,18 @@ enc_bin_sig(BinSig) ->
     Size = byte_size(BinSig),
     <<?UINT16(Size), BinSig/binary>>.
 
-%% Renegotiation info, only current extension
+hello_extensions(RenegotiationInfo, NextProtocolNegotiation) ->
+    hello_extensions(RenegotiationInfo) ++ next_protocol_extension(NextProtocolNegotiation).
+
+%% Renegotiation info
 hello_extensions(#renegotiation_info{renegotiated_connection = undefined}) ->
     [];
 hello_extensions(#renegotiation_info{} = Info) ->
+    [Info].
+
+next_protocol_extension(undefined) ->
+    [];
+next_protocol_extension(#next_protocol_negotiation{} = Info) ->
     [Info].
 
 enc_hello_extensions(Extensions) ->
@@ -1043,6 +1159,9 @@ enc_hello_extensions([], Acc) ->
     Size = byte_size(Acc),
     <<?UINT16(Size), Acc/binary>>;
 
+enc_hello_extensions([#next_protocol_negotiation{extension_data = ExtensionData} | Rest], Acc) ->
+    Len = byte_size(ExtensionData),
+    enc_hello_extensions(Rest, <<?UINT16(?NEXTPROTONEG_EXT), ?UINT16(Len), ExtensionData/binary, Acc/binary>>);
 enc_hello_extensions([#renegotiation_info{renegotiated_connection = ?byte(0) = Info} | Rest], Acc) ->
     Len = byte_size(Info),
     enc_hello_extensions(Rest, <<?UINT16(?RENEGOTIATION_EXT), ?UINT16(Len), Info/binary, Acc/binary>>);

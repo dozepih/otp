@@ -89,7 +89,8 @@
 	  session_id,         % opaque SessionID<0..32>
 	  cipher_suites,      % cipher_suites<2..2^16-1>
 	  compression_methods, % compression_methods<1..2^8-1>,
-	  renegotiation_info
+	  renegotiation_info,
+	  next_protocol_negotiation = undefined :: undefined | list(binary())
 	 }).
 
 -record(server_hello, {
@@ -98,7 +99,8 @@
 	  session_id,         % opaque SessionID<0..32>
 	  cipher_suite,       % cipher_suites
 	  compression_method, % compression_method
-	  renegotiation_info
+	  renegotiation_info,
+	  next_protocol_negotiation = undefined :: undefined | list(binary())
 	 }).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -212,6 +214,18 @@
 -record(renegotiation_info,{
 	  renegotiated_connection
 	 }).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Next Protocol Negotiation
+%% (http://tools.ietf.org/html/draft-agl-tls-nextprotoneg-02)
+%% (http://technotes.googlecode.com/git/nextprotoneg.html)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+-define(NEXTPROTONEG_EXT, 13172).
+-define(NEXT_PROTOCOL, 67).
+-record(next_protocol_negotiation, {extension_data}).
+
+-record(next_protocol, {selected_protocol}).
 
 -endif. % -ifdef(ssl_handshake).
 
