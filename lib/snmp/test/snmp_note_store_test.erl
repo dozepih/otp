@@ -38,7 +38,8 @@
 	 start_and_stop/1,
 	 notes/1,
 	 info/1,
-	 garbage_in/1
+	 garbage_in/1,
+	 gc_timer/1
 	]).
 
 %%----------------------------------------------------------------------
@@ -70,7 +71,7 @@ end_per_testcase(_Case, Config) when is_list(Config) ->
 %% Test case definitions
 %%======================================================================
 all() -> 
-[start_and_stop, notes, info, garbage_in].
+[start_and_stop, notes, info, garbage_in, gc_timer].
 
 groups() -> 
     [].
@@ -252,6 +253,41 @@ garbage_in(Config) when is_list(Config) ->
     io:format("done~n", []),
     ok.
 
+%%======================================================================
+
+gc_timer(suite) -> [];
+gc_timer(doc) -> ["GC timer regression."];
+gc_timer(Config) when is_list(Config) ->
+    Mem = fun (Info) ->
+		  {db_memory, DB} = lists:keyfind(db_memory, 1, Info),
+		  {notes, N} = lists:keyfind(notes, 1, DB),
+		  N
+	  end,
+    GC_timeout = 500,
+    Opts = [{verbosity, debug}, {timeout, GC_timeout}],
+    {ok, Handler, Pid} = note_store_handler_start(Opts),
+    io:format("sleep some before we begin the tests~n", []),
+    ?SLEEP(timer:seconds(1)),
+    NotesEmpty = Mem(snmp_note_store:info(Pid)),
+    io:format("notes memory (empty): ~p~n", [NotesEmpty]),
+    io:format("fill store with notes that will expire "
+	      "in 100ms~n"),
+    [true = snmp_note_store:set_note(Pid, 100, {key, V},
+				     value)
+     || V <- lists:seq(1, 20)],
+    NotesNotEmpty = Mem(snmp_note_store:info(Pid)),
+    io:format("notes memory (not empty): ~p~n",
+	      [NotesNotEmpty]),
+    true = NotesNotEmpty > NotesEmpty,
+    io:format("wait 3 times the GC timeout~n"),
+    ?SLEEP(GC_timeout * 3),
+    NotesAfterGC = Mem(snmp_note_store:info(Pid)),
+    io:format("notes memory (after GC): ~p~n",
+	      [NotesAfterGC]),
+    io:format("verify notes db memory~n"),
+    NotesAfterGC = NotesEmpty,
+    note_store_handler_stop(Handler),
+    ok.
 
 %%======================================================================
 %% Internal functions
@@ -265,8 +301,11 @@ system_start_time() ->
     end.
 
 note_store_handler_start() ->
+    note_store_handler_start([{verbosity, trace}]).
+
+note_store_handler_start(Opts) ->
     Self = self(),
-    Fun = fun() -> note_store_handler(Self) end,
+    Fun = fun() -> note_store_handler(Self, Opts) end,
     HandlerPid = spawn_link(Fun),
     receive
 	{started, HandlerPid, NSPid} ->
@@ -286,12 +325,11 @@ note_store_handler_stop(Pid) ->
 	    {error, timeout}
     end.
 
-note_store_handler(Parent) ->
+note_store_handler(Parent, Opts) ->
     erlang:register(note_store_handler, self()),
     put(system_start_time, snmp_misc:now(cs)),
     Prio = normal,
     Mod  = ?MODULE, 
-    Opts = [{verbosity, trace}], 
     {ok, Pid} = snmp_note_store:start_link(Prio, Mod, Opts),
     Parent ! {started, self(), Pid},
     note_store_handler_loop(Parent, Pid).
